@@ -13,7 +13,7 @@ import torchvision.transforms as transforms
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
-from models import Vanilla
+from models import vanilla,resnet
 from average_meter import AverageMeter
 from utils import qr_null, test_filter_sparsity, accuracy
 from tensorboardX import SummaryWriter
@@ -21,17 +21,17 @@ from tensorboardX import SummaryWriter
 parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument('--lr', type=float, default=0.01, help="learning rate")
-parser.add_argument('--repr', action='store_true', help="whether to use RePr training scheme")
+parser.add_argument('--repr', type=bool, help="whether to use RePr training scheme",default=False)
 parser.add_argument('--S1', type=int, default=20, help="S1 epochs for RePr")
 parser.add_argument('--S2', type=int, default=10, help="S2 epochs for RePr")
 parser.add_argument('--epochs', type=int, default=100, help="total epochs for training")
-parser.add_argument('--workers', type=int, default=16, help="number of worker to load data")
-parser.add_argument('--print_freq', type=int, default=50, help="print frequency")
+parser.add_argument('--workers', type=int, default=1, help="number of worker to load data")
+parser.add_argument('--print_freq', type=int, default=100, help="print frequency")
 parser.add_argument('--gpu', type=int, default=0, help="gpu id")
 parser.add_argument('--save_model', type=str, default='best.pt', help="path to save model")
 parser.add_argument('--prune_ratio', type=float, default=0.3, help="prune ratio")
-parser.add_argument('--comment', type=str, default='', help="tag for tensorboardX event name")
-parser.add_argument('--zero_init', action='store_true', help="whether to initialize with zero")
+parser.add_argument('--comment', type=str, default='Vanilla3-20-10-0.01-0.3-wu-bs128-cifar10', help="tag for tensorboardX event name")
+parser.add_argument('--zero_init', type=bool,default=True,help="whether to initialize with zero")
 
 def train(train_loader, criterion, optimizer, epoch, model, writer, mask, args, conv_weights):
     batch_time = AverageMeter()
@@ -57,7 +57,7 @@ def train(train_loader, criterion, optimizer, epoch, model, writer, mask, args, 
 
         acc1, _ = accuracy(output, target, topk=(1, 5))
 
-        losses.update(loss.item(), data.size(0))
+        losses.update(loss.item(), data.size(0),acc=False)
         top1.update(acc1[0], data.size(0))
 
         optimizer.zero_grad()
@@ -75,7 +75,7 @@ def train(train_loader, criterion, optimizer, epoch, model, writer, mask, args, 
         optimizer.step()
 
         # measure elapsed time
-        batch_time.update(time.time() - end)
+        batch_time.update(time.time() - end,acc=False)
 
         if i % args.print_freq == 0:
             print('Epoch: [{0}][{1}/{2}]\t'
@@ -88,6 +88,7 @@ def train(train_loader, criterion, optimizer, epoch, model, writer, mask, args, 
                       epoch, i, len(train_loader), batch_time=batch_time,
                       data_time=data_time, loss=losses, top1=top1,
                       lr=optimizer.param_groups[0]['lr']))
+            # print(conv_weights)
 
         end = time.time()
     writer.add_scalar('Train/Acc', top1.avg, epoch)
@@ -114,11 +115,11 @@ def validate(val_loader, criterion, model, writer, args, epoch, best_acc):
 
             # measure accuracy and record loss
             acc1, _ = accuracy(output, target, topk=(1, 5))
-            losses.update(loss.item(), data.size(0))
+            losses.update(loss.item(), data.size(0),acc=False)
             top1.update(acc1[0], data.size(0))
 
             # measure elapsed time
-            batch_time.update(time.time() - end)
+            batch_time.update(time.time() - end,acc=False)
 
             if i % args.print_freq == 0:
                 print('Test: [{0}/{1}]\t'
@@ -153,6 +154,9 @@ def pruning(conv_weights, prune_ratio):
         P = torch.abs(W_WT - I)
         P = P.sum(dim=1) / size[0]
         inter_filter_ortho[name] = P.cpu().detach().numpy()
+        # rank=np.argsort(inter_filter_ortho[name])
+        # for i in rank[:int(size[0]*0.6)]:
+        #     inter_filter_ortho[name][i]=0
     # the ranking is computed overall the filters in the network
     ranks = np.concatenate([v.flatten() for v in inter_filter_ortho.values()])
     threshold = np.percentile(ranks, 100*(1-prune_ratio))
@@ -167,9 +171,11 @@ def pruning(conv_weights, prune_ratio):
         drop_filters[name] = None
         if mask[name].size > 0:
             with torch.no_grad():
+                # weight before prune
                 drop_filters[name] = W.data[mask[name]].view(mask[name].size, -1).cpu().numpy()
                 W.data[mask[name]] = 0
-
+    # Judge the sparsity of convolution kernel of each layer
+    # that is, the ratio of convolution kernel set 0 to the total number of the layer
     test_filter_sparsity(conv_weights)
     return prune, mask, drop_filters
 
@@ -185,8 +191,10 @@ def reinitialize(mask, drop_filters, conv_weights, fc_weights, zero_init):
                 stdv = 1. / math.sqrt(size[1]*size[2]*size[3])  # https://github.com/pytorch/pytorch/blob/08891b0a4e08e2c642deac2042a02238a4d34c67/torch/nn/modules/conv.py#L40-L47
                 W2d = W.view(size[0], -1).cpu().numpy()
                 null_space = qr_null(np.vstack((drop_filters[name], W2d)))
+                ortho = np.vstack((drop_filters[name], W2d)).dot(null_space)
                 null_space = torch.from_numpy(null_space).cuda()
 
+                print(ortho)
                 if null_space.size == 0:
                     W.data[mask[name]].uniform_(-stdv, stdv)
                 else:
@@ -194,25 +202,26 @@ def reinitialize(mask, drop_filters, conv_weights, fc_weights, zero_init):
                     null_count = 0
                     for mask_idx in mask[name]:
                         if null_count < null_space.size(0):
-                            W.data[mask_idx] = null_space.data[null_count].clamp_(-stdv, stdv)
+                            W.data[mask_idx] = null_space.data[null_count]
+                                # .clamp_(-stdv, stdv)
                             null_count += 1
                         else:
                             W.data[mask_idx].uniform_(-stdv, stdv)
 
             # mask channels of prev-layer-pruned-filters' outputs
-            if prev_layer_name is not None:
-                if W.dim() == 4:  # conv
-                    if zero_init:
-                        W.data[:, mask[prev_layer_name]] = 0
-                    else:
-                        W.data[:, mask[prev_layer_name]].uniform_(-stdv, stdv)
-                elif W.dim() == 2: # fc
-                    if zero_init:
-                        W.view(W.size(0), prev_num_filters, -1).data[:, mask[prev_layer_name]] = 0
-                    else:
-                        stdv = 1. / math.sqrt(W.size(1))
-                        W.view(W.size(0), prev_num_filters, -1).data[:, mask[prev_layer_name]].uniform_(-stdv, stdv)
-            prev_layer_name, prev_num_filters = name, W.size(0)
+            # if prev_layer_name is not None:
+            #     if W.dim() == 4:  # conv
+            #         if zero_init:
+            #             W.data[mask[prev_layer_name]] = 0
+            #         else:
+            #             W.data[mask[prev_layer_name]].uniform_(-stdv, stdv)
+            #     elif W.dim() == 2: # fc
+            #         if zero_init:
+            #             W.view(W.size(0), prev_num_filters, -1).data[mask[prev_layer_name]] = 0
+            #         else:
+            #             stdv = 1. / math.sqrt(W.size(1))
+            #             W.view(W.size(0), prev_num_filters, -1).data[mask[prev_layer_name]].uniform_(-stdv, stdv)
+            # prev_layer_name, prev_num_filters = name, W.size(0)
     test_filter_sparsity(conv_weights)
 
 def main():
@@ -221,7 +230,8 @@ def main():
     cudnn.benchmark = True
 
     args = parser.parse_args()
-
+    print(args.repr)
+    print(args.zero_init)
     # Data
     print('==> Preparing data..')
 
@@ -238,20 +248,21 @@ def main():
     ])
 
     trainset = torchvision.datasets.CIFAR10(
-        root='./data', train=True, download=True, transform=transform_train)
+        root='./data/', train=True, download=True, transform=transform_train)
     trainloader = torch.utils.data.DataLoader(
-        trainset, batch_size=128, shuffle=True, num_workers=args.workers)
+        trainset, batch_size=64, shuffle=True, num_workers=args.workers)
 
     testset = torchvision.datasets.CIFAR10(
-        root='./data', train=False, download=True, transform=transform_test)
+        root='./data/', train=False, download=True, transform=transform_test)
     testloader = torch.utils.data.DataLoader(
         testset, batch_size=100, shuffle=False, num_workers=args.workers)
 
     # Model
     print('==> Building model..')
-
-    model = Vanilla()
+    model=vanilla.Vanilla3(num_classes=10)
+    # model = resnet.resnet18()
     print(model)
+
 
     if args.gpu is not None:
         torch.cuda.set_device(args.gpu)
@@ -263,14 +274,25 @@ def main():
     conv_weights = []
     fc_weights = []
     for name, W in model.named_parameters():
-        if W.dim() == 4:
+        if W.dim() == 4 :
+            # and W.size()[1] != 3
             conv_weights.append((name, W))
+
         elif W.dim() == 2:
+
             fc_weights.append((name, W))
+        # if('.0.weight' in name) or ('.3.weight' in name):
+        #     if 'conv1.0.weight' in name:
+        #         pass
+        #     elif W.dim() == 4 :
+        #         conv_weights.append((name, W))
+        # if ('fc.weight' in name):
+        #     if W.dim()==2:
+        #         fc_weights.append((name, W))
 
     criterion = nn.CrossEntropyLoss().cuda()
     optimizer = torch.optim.SGD(model.parameters(), args.lr)
-    comment = "-{}-{}-{}".format("repr" if args.repr else "norepr", args.epochs, args.comment)
+    comment = "-{}-{}-{}-{}".format("repr" if args.repr else "norepr","zero_init" if args.zero_init else "random_init", args.epochs, args.comment)
     writer = SummaryWriter(comment=comment)
 
     mask = None
@@ -283,10 +305,16 @@ def main():
             if any(epoch == s for s in range(args.S1, args.epochs, args.S1+args.S2)):
                 prune, mask, drop_filters = pruning(conv_weights, args.prune_ratio)
                 prune_map.append(np.concatenate(list(prune.values())))
+
             # check if the end of S2 stage
             if any(epoch == s for s in range(args.S1+args.S2, args.epochs, args.S1+args.S2)):
                 reinitialize(mask, drop_filters, conv_weights, fc_weights, args.zero_init)
+
         train(trainloader, criterion, optimizer, epoch, model, writer, mask, args, conv_weights)
+        # if args.repr and epoch >= args.S1:
+        #     for name, W in conv_weights:
+        #         print(W.data[mask[name][0],0])
+        #         print(conv_weights[1][1].data[0,0])
         acc = validate(testloader, criterion, model, writer, args, epoch, best_acc)
         best_acc = max(best_acc, acc)
         test_filter_sparsity(conv_weights)
